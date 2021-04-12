@@ -1,0 +1,308 @@
+library(tidyverse)
+library(foreach)
+library(readxl)
+library(lubridate)
+library(scales)
+
+round_down<-function(x,num){
+  floor(round(x*10^num,digits = 8))/10^num
+}
+
+df2list<-function(...){
+  Map(list,...)
+}
+
+#dateを年度に変換
+#fyear:fiscal year:会計年度
+date2fyear<-function(date){
+  year(date)+if_else(month(date)<=3,-1,0)
+}
+
+diff_date <- function(start,end,unit){
+  time_length(interval(start,end),unit = unit)
+}
+
+#会計年度,クーポン月日>>クーポン受領日
+fyear2coupon_date<-function(fyear,coupon_md){
+  coupon_date<-ymd(sprintf("%4d%s",fyear,coupon_md))
+  coupon_date+if_else(month(coupon_date)<=3,years(1),days(0))
+}
+
+#df内のstart_data,coupon_mdからクーポン受領日を求める
+calc_coupon_date<-function(df,str_coupon_md){
+  if(all(c("delivery_date","maturity_date","start_date",str_coupon_md) %in% names(df))){
+    df<-df %>% rename(coupon_md=!!sym(str_coupon_md))
+    y_s<-with(df,date2fyear(start_date))
+    # coupon_md<-with(df,coupon_md)
+    coupon_date<-with(df,fyear2coupon_date(fyear=y_s,coupon_md))
+    coupon_date[with(df,coupon_date<=delivery_date | maturity_date<coupon_date)]<-NA
+  }else{
+    coupon_date<-NULL
+  }
+  coupon_date
+}
+
+#df内の次期クーポン受領日を求める
+calc_next_coupon_date<-function(df){
+  if(all(c("delivery_date","maturity_date","start_date",sprintf("coupon%s_md",1:2)) %in% names(df))){
+    y_s<-with(df,date2fyear(start_date))+1
+    coupon1_date<-with(df,fyear2coupon_date(y_s,coupon_md=coupon1_md))
+    coupon2_date<-with(df,fyear2coupon_date(y_s,coupon_md=coupon2_md))
+    coupon_date<-pmin(coupon1_date,coupon2_date)
+    coupon_date[with(df,coupon_date<=delivery_date | maturity_date<=coupon_date)]<-NA
+  }else{
+    coupon_date<-NULL
+  }
+  coupon_date
+}
+
+#df内の前回クーポン受領日を求める
+calc_prev_coupon_date<-function(df){
+  if(all(c("delivery_date","maturity_date","start_date",sprintf("coupon%s_md",1:2)) %in% names(df))){
+    y_s<-with(df,date2fyear(start_date))-1
+    coupon1_date<-with(df,fyear2coupon_date(y_s,coupon_md=coupon1_md))
+    coupon2_date<-with(df,fyear2coupon_date(y_s,coupon_md=coupon2_md))
+    coupon_date<-pmax(coupon1_date,coupon2_date)
+    coupon_date[with(df,coupon_date<=delivery_date | maturity_date<=coupon_date)]<-NA
+  }else{
+    coupon_date<-NULL
+  }
+  coupon_date
+}
+
+#満期まで各年度のデータを複製する
+duplicate<-function(df){
+  df<-df %>% 
+    mutate(current_maturity_year_delivery=date2fyear(maturity_date)-date2fyear(delivery_date))
+  
+  bind_rows(
+    df %>% mutate(elapse_years=0)
+    ,cbind(df[rep(seq(nrow(df)),df$current_maturity_year_delivery),]
+           ,elapse_years=sapply(df$current_maturity_year_delivery,seq) %>% unlist)
+  )
+}
+
+calc_price_rate<-function(df){
+  stopifnot(all(c("end_date","maturity_date","coupon_rate","yield")%in% names(df)))
+  df %>% 
+    mutate(N=diff_date(end_date,maturity_date,unit = "month")%/%6+1
+           ,next_coupon_date_=maturity_date%m-%months((N-1)*6)+
+             if_else(is.na(maturity_date-months((N-1)*6)),days(1),days(0))
+           ,DSC=diff_date(end_date,next_coupon_date_,unit = "day")
+           ,E=diff_date(next_coupon_date_%m-%months(6),next_coupon_date_,unit = "day")
+           ,A=E-DSC
+           ,exp_1st=if_else(N==1
+                            ,coupon_rate/2+1
+                            ,(1+yield/2)^(-N+1-DSC/E))
+           ,exp_2nd=if_else(N==1
+                            ,yield/2*(E-A)/E+1
+                            ,coupon_rate/yield*(1+yield/2)^(1-DSC/E)*(1-(1+yield/2)^(-N)))
+           ,exp_3rd=coupon_rate/2*A/E
+           ,price_rate=if_else(N==1,exp_1st/exp_2nd-exp_3rd,exp_1st+exp_2nd-exp_3rd)) %>% 
+    select(all_of(c(names(df),"price_rate")))
+}
+
+
+calc_interest_batch<-function(arg,type="interest_rate"){
+  issued_date<-arg$issued_date
+  maturity_date<-arg$maturity_date
+  coupon_rate<-arg$coupon_rate
+  round_down_num<-7
+  
+  coupon_num_max<-diff_date(issued_date,maturity_date,unit = "month")%/%6
+  interval_rest<-diff_date(issued_date %m+% months(coupon_num_max*6),maturity_date,unit = "day")
+  
+  if(type=="interest_rate"){
+    result<-data.frame(coupon_num=0:coupon_num_max
+                       ,stringsAsFactors = F) %>% 
+      mutate(coupon_date=issued_date %m+% months(coupon_num*6)
+             ,interest_rate=round_down((1+coupon_rate/2)^coupon_num,num = round_down_num)-1
+             ,acquired_interest_rate=coupon_rate/2*(1+coupon_rate/2)^(coupon_num_max-coupon_num)*
+               round_down(1+coupon_rate*interval_rest/365,num = round_down_num)
+             ,acquired_interest_rate_next=lead(acquired_interest_rate,n=1)
+             ,unacquired_interest_rate=sum(acquired_interest_rate)+coupon_rate*interval_rest/365-cumsum(acquired_interest_rate)
+             ,coupon_turn=if_else(between(month(coupon_date),4,9),1,2)#上期なら1,下期なら2
+             ,curr_date=ymd(sprintf("%d0331"
+                                    ,date2fyear(coupon_date)+1))) %>% 
+      pivot_wider(names_from = coupon_turn
+                  ,values_from = c(coupon_num
+                                   ,coupon_date
+                                   ,interest_rate
+                                   ,acquired_interest_rate
+                                   ,acquired_interest_rate_next
+                                   ,unacquired_interest_rate)) %>% 
+      mutate(accrued_interest_rate=if_else(curr_date<maturity_date
+                                           ,round_down((1+interest_rate_2)*
+                                                         round_down(1+coupon_rate*
+                                                                      diff_date(coupon_date_2,curr_date,unit = "day")/365,num = round_down_num)
+                                                       ,num = round_down_num)-1
+                                           ,0)
+             ,unacquired_interest_rate=if_else(curr_date<maturity_date
+                                         ,unacquired_interest_rate_2-acquired_interest_rate_next_2*
+                                           diff_date(coupon_date_2,curr_date,unit = "day")/
+                                           diff_date(coupon_date_2,coupon_date_2%m+%months(6),unit = "day")
+                                         ,0)
+      ) %>%
+      select(curr_date,accrued_interest_rate,unacquired_interest_rate)    
+  }else if(type=="maturity"){
+    result<-data.frame(maturity_date=maturity_date
+                       ,maturity_rate=round_down(
+                         round_down((1+coupon_rate/2)^coupon_num_max,num = round_down_num)*
+                           round_down((1+coupon_rate*interval_rest/365),num = round_down_num)
+                         ,num = round_down_num)-1
+                       ,stringsAsFactors = F)
+  }else{
+    result<-NULL
+  }
+  result
+}
+
+calc_cf_buy <- function(bond_data_buy
+                        ,opening_date
+                        ,interest_batch
+                        ,maturity_rate
+                        ,interest_batch_rate
+                        ,risk_free_rate
+                        ,credit_spread) {
+  df<-duplicate(df=bond_data_buy) %>% 
+    mutate(end_date=opening_date-days(1)+years(date2fyear(delivery_date)+elapse_years-date2fyear(opening_date)+1)
+           ,start_date=end_date-years(1)+days(1)
+           ,end_date=pmin(maturity_date,end_date)
+           ,start_date=pmax(delivery_date,start_date)
+           ,elapse_months_init=ceiling(diff_date(delivery_date,ymd(sprintf("%d0331",date2fyear(delivery_date)+1)),unit = "month"))+
+             #1/31->3/31は2-months、2/28->3/31は1-monthと計算して欲しい
+             #だがceiling(diff_date(x,yyyy/3/31))だと31日までない月は,xが月末であっても1カ月多くなってしまうため調整している
+             #ex:diff_date(ymd(20200131),ymd(20200331),unit = "month")
+             #ex:diff_date(ymd(20200229),ymd(20200331),unit = "month")
+             if_else(delivery_date==ceiling_date(delivery_date,unit = "month")-days(1) & day(delivery_date)!=31,-1,0)
+           ,current_maturity_month_delivery=ceiling(diff_date(delivery_date,maturity_date,unit = "month"))
+           ,months_adjust=if_else(day(delivery_date)<day(maturity_date) |
+                                         delivery_date==ceiling_date(delivery_date,unit = "month")-days(1)
+                                       ,1
+                                       ,(current_maturity_month_delivery-elapse_months_init)/(current_maturity_month_delivery-elapse_months_init+1)
+           )) %>% 
+    filter(opening_date<=start_date)
+
+  df <- cbind(df
+              ,coupon1_date_=calc_coupon_date(df=df,str_coupon_md = "coupon1_md")
+              ,coupon2_date_=calc_coupon_date(df=df,str_coupon_md = "coupon2_md")
+              ,next_coupon_date=calc_next_coupon_date(df)
+              ,prev_coupon_date=calc_prev_coupon_date(df)) %>% 
+    mutate(curr_fyear=date2fyear(start_date)
+           ,current_maturity_year=as.character(date2fyear(maturity_date)-curr_fyear-1)
+           ,coupon_rate=if_else(stock_code %in% interest_batch,0,coupon_rate/100)
+           ,risk_free_rate_type=if_else(date2fyear(opening_date)==curr_fyear,"real","assumption")) %>% 
+    left_join(risk_free_rate,by=c("current_maturity_year","risk_free_rate_type")) %>% 
+    left_join(credit_spread,by="stock_code") %>% 
+    replace_na(list(credit_spread=0)) %>% 
+    mutate(yield=risk_free+credit_spread)
+  
+  if(is.data.frame(maturity_rate) & is.data.frame(interest_batch_rate)){
+    df <- df %>% 
+      left_join(maturity_rate,by="stock_code") %>%
+      left_join(interest_batch_rate %>% 
+                  mutate(start_date=end_date+days(1)) %>%
+                  select(-end_date) %>% 
+                  rename(accrued_interest_rate_s=accrued_interest_rate
+                         ,unacquired_interest_rate_s=unacquired_interest_rate)
+                ,by=c("stock_code","start_date")) %>% 
+      left_join(interest_batch_rate %>% 
+                  rename(accrued_interest_rate_e=accrued_interest_rate
+                         ,unacquired_interest_rate_e=unacquired_interest_rate)
+                ,by=c("stock_code","end_date"))
+  }else{
+    #interest_batchの対象債券が無い場合はゼロで埋める
+    df <- df %>% 
+      mutate(maturity_rate=0
+             ,accrued_interest_rate_s=0
+             ,unacquired_interest_rate_s=0
+             ,accrued_interest_rate_e=0
+             ,unacquired_interest_rate_e=0)
+  }
+  
+  df %>%
+    mutate(coupon1_date=case_when(is.na(coupon1_date_) & is.na(coupon2_date_) ~ ymd(NA)
+                                  ,between(month(pmin(coupon1_date_,coupon2_date_,na.rm = T)),4,9) ~ pmin(coupon1_date_,coupon2_date_,na.rm = T)
+                                  ,TRUE ~ ymd(NA))
+           ,coupon2_date=case_when(is.na(coupon1_date_) & is.na(coupon2_date_) ~ ymd(NA)
+                                   ,!between(month(pmax(coupon1_date_,coupon2_date_,na.rm = T)),4,9) ~ pmax(coupon1_date_,coupon2_date_,na.rm = T)
+                                   ,TRUE ~ ymd(NA))
+           ,coupon1=par*coupon_rate/2*if_else(is.na(coupon1_date),0,1)*if_else(stock_code %in% interest_batch,0,1)
+           ,coupon2=par*coupon_rate/2*if_else(is.na(coupon2_date),0,1)*if_else(stock_code %in% interest_batch,0,1)
+           ,coupon_maturity=case_when(curr_fyear!=date2fyear(maturity_date) ~ 0
+                                      ,stock_code %in% interest_batch ~ par*maturity_rate
+                                      ,!(is.na(prev_coupon_date) & is.na(coupon1_date) & is.na(coupon2_date)) ~ 
+                                        par*coupon_rate*diff_date(pmax(prev_coupon_date,coupon1_date,coupon2_date,na.rm = T)
+                                                                  ,maturity_date,unit = "day")/365
+                                      ,TRUE ~ 0)
+           ,maturity=par*if_else(start_date<=maturity_date & maturity_date<=end_date,1,0)
+           ,amt=coupon1+coupon2+coupon_maturity+maturity
+           ,elapse_months_s=if_else(date2fyear(delivery_date)==date2fyear(start_date)
+                                    ,0
+                                    ,ceiling(diff_date(delivery_date,start_date-days(1),unit = "month"))+
+                                      if_else(delivery_date==ceiling_date(delivery_date,unit = "month")-days(1) & day(delivery_date)!=31,-1,0))
+           ,elapse_months_e=ceiling(diff_date(delivery_date,end_date,unit = "month"))+
+             if_else(delivery_date==ceiling_date(delivery_date,unit = "month")-days(1) & day(delivery_date)!=31,-1,0)
+           ,amoacc_sum_s=if_else(elapse_months_s==0
+                                 ,0
+                                 ,ceiling((par-trade_amount)*
+                                              (elapse_months_init+months_adjust*(elapse_months_s-elapse_months_init))/current_maturity_month_delivery))
+           ,amoacc_sum_e=if_else(current_maturity_month_delivery==elapse_months_e
+                                 ,par-trade_amount
+                                 ,ceiling((par-trade_amount)*
+                                            (elapse_months_init+months_adjust*(elapse_months_e-elapse_months_init))/current_maturity_month_delivery))
+           ,amoacc_end=if_else(current_maturity_year_delivery==elapse_years,0,amoacc_sum_e-amoacc_sum_s)
+           ,amoacc=amoacc_sum_e-amoacc_sum_s
+           ,book_value_curr_s=trade_amount+amoacc_sum_s
+           ,book_value_curr_e=if_else(current_maturity_year_delivery==elapse_years,0,trade_amount+amoacc_sum_e)
+           ,coupon2_date_accurued_s=if_else(curr_fyear-1==date2fyear(delivery_date) & is.na(prev_coupon_date),delivery_date,prev_coupon_date)
+           ,accrued_interest_s=if_else(is.na(coupon2_date_accurued_s) | curr_fyear==date2fyear(delivery_date)
+                                       ,0
+                                       ,round_down(par*if_else(stock_code %in% interest_batch
+                                                               ,accrued_interest_rate_s
+                                                               ,round_down(coupon_rate*
+                                                                             diff_date(coupon2_date_accurued_s,start_date-days(1),unit = "day")/365,num = 9))
+                                                   ,num = 0))
+           ,coupon2_date_accurued_e=if_else(curr_fyear==date2fyear(delivery_date) & is.na(coupon2_date),delivery_date,coupon2_date)
+           ,accrued_interest_e=if_else(is.na(coupon2_date_accurued_e) | curr_fyear==date2fyear(maturity_date)
+                                     ,0
+                                     ,round_down(par*if_else(stock_code %in% interest_batch
+                                                             ,accrued_interest_rate_e
+                                                             ,round_down(coupon_rate*
+                                                                           diff_date(coupon2_date_accurued_e,end_date,unit = "day")/365,num = 9))
+                                                 ,num = 0))
+           ,benefit=coupon1+coupon2+coupon_maturity+amoacc-accrued_interest_s+accrued_interest_e) %>% 
+    calc_price_rate() %>% 
+    mutate(price=if_else(current_maturity_year_delivery==elapse_years
+                         ,0
+                         ,round_down(par*if_else(stock_code %in% interest_batch
+                                                 ,1+unacquired_interest_rate_e
+                                                 ,1)*price_rate
+                                     ,num = 0))
+           ,unrealized=price-book_value_curr_e
+           ,par=par*if_else(current_maturity_year_delivery==elapse_years,0,1)) %>% 
+    select(-coupon1_md,-coupon2_md,-coupon1_date_,-coupon2_date_) %>% 
+    bind_rows() %>% 
+    return()
+}
+
+calc_cf_sell <- function(bond_cf_buy, bond_data_sell) {
+  bond_cf_buy %>% 
+    inner_join(bond_data_sell
+               ,by=c("stock_code","no")) %>% 
+    filter(date2fyear(sell_date)<=curr_fyear) %>% 
+    mutate(dealing="sell"
+           ,coupon1=coupon1*if_else(!is.na(coupon1_date) & sell_date<coupon1_date,-ratio,0)
+           ,coupon2=coupon2*if_else(!is.na(coupon2_date) & sell_date<coupon2_date,-ratio,0)
+           ,amoacc_sum_s=amoacc_sum_s*if_else(sell_date<start_date,-ratio,0)
+           ,book_value_curr_s=book_value_curr_s*if_else(sell_date<start_date,-ratio,0)
+           ,accrued_interest_s=accrued_interest_s*if_else(sell_date<start_date,-ratio,0)) %>% 
+    mutate(across(c(par,trade_amount
+                    ,coupon_maturity,maturity
+                    ,amoacc_sum_e,amoacc_end,book_value_curr_e,accrued_interest_e,price,unrealized)
+                  ,.fns = ~.*if_else(sell_date<end_date,-ratio,0))) %>% 
+    mutate(amt=coupon1+coupon2+coupon_maturity+maturity
+           ,amoacc=amoacc_sum_e-amoacc_sum_s
+           ,benefit=coupon1+coupon2+coupon_maturity+amoacc-accrued_interest_s+accrued_interest_e) %>% 
+    return()
+}
