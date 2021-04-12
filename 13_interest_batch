@@ -1,0 +1,12 @@
+sequenceDiagram
+  participant 発行日
+  participant 利払応当日1
+  participant 期末
+  participant 利払応当日2
+  participant 最終利払応当日
+  participant 償還日
+  
+  発行日->>償還日:保有
+  利払応当日1-->期末:elapse
+  利払応当日1-->利払応当日2:interval
+  最終利払応当日-->償還日:rest
