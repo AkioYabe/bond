@@ -1,0 +1,67 @@
+graph LR
+
+subgraph data/dat/yyyymm
+  IT51("IT51*.dat")
+end
+
+subgraph data/csv
+  csv("bond_cf_yyyymmdd.csv")
+end
+
+subgraph excel
+  col_name
+  stock_info
+  yield
+end
+
+subgraph work
+  base_date_num
+  opening_date
+  interest_batch
+  first_call
+  risk_free_rate
+  credit_spread
+  bond_raw
+  bond_data_buy
+  bond_data_sell
+  interest_batch_list
+  interest_batch_rate
+  maturity_rate
+  bond_cf_buy
+  bond_cf_sell
+  bond_cf
+end
+
+IT51-->bond_raw
+col_name-->bond_raw
+stock_info-->interest_batch
+stock_info-->first_call
+yield-->risk_free_rate
+yield-->credit_spread
+base_date_num-->opening_date
+%% bond_data_buy
+bond_raw-->bond_data_buy
+base_date_num-->bond_data_buy
+first_call-->bond_data_buy
+%% interest_batch
+bond_data_buy-->interest_batch_list
+interest_batch-->interest_batch_list
+interest_batch_list-->|calc_interest_batch|interest_batch_rate
+interest_batch_list-->|calc_interest_batch|maturity_rate
+%% bond_cf_buy
+opening_date-->|calc_cf_buy|bond_cf_buy
+bond_data_buy-->|calc_cf_buy|bond_cf_buy
+interest_batch-->|calc_cf_buy|bond_cf_buy
+maturity_rate-->|calc_cf_buy|bond_cf_buy
+interest_batch_rate-->|calc_cf_buy|bond_cf_buy
+risk_free_rate-->|calc_cf_buy|bond_cf_buy
+credit_spread-->|calc_cf_buy|bond_cf_buy
+%% sell
+bond_raw-->bond_data_sell
+bond_data_sell-->bond_data_sell
+bond_cf_buy-->|calc_cf_sell|bond_cf_sell
+bond_data_sell-->|calc_cf_sell|bond_cf_sell
+%% union
+bond_cf_buy-->|bind_rows|bond_cf
+bond_cf_sell-->|bind_rows|bond_cf
+bond_cf-->csv
