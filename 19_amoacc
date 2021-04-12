@@ -1,0 +1,20 @@
+sequenceDiagram
+  participant 受渡日
+  participant 期末1
+  participant 期末2
+  participant 償還日
+  
+  opt calc1
+    受渡日->>期末1:num1
+    受渡日->>償還日:denom1
+  end
+  
+  opt calc2
+    期末1->>期末2:num2
+    期末1->>償還日:denom2
+  end
+  
+  opt calc3
+    期末2->>償還日:num3
+    期末2->>償還日:denom3
+  end
