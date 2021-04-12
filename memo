@@ -1,0 +1,295 @@
+---
+title: "債券CF計算に関するメモ"
+author: "yabe"
+date: "`r format(Sys.time(), '%Y/%m/%d')`"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    number_section: true
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+$\newcommand{\eq}[1]{\begin{eqnarray} #1 \end{eqnarray}}$
+$\newcommand{\case}[1]{\begin{cases} #1 \end{cases}}$
+$\renewcommand{\dfdefault}{tt}$
+
+# 概要
+
+## 作成の経緯
+
+- 従前までは会社シミュレーションで作成しているエクセルを使用して債券CFを作成していたが、オリジナルの計算プログラムを作成することにした。
+- 作成の動機は以下のとおり
+  - 計算の仕組みを理解しておきたかった
+    - 自分で計算することで理解が深まる期待があった(実際には自分の記憶力が低いせいで脳内に何も残らなかったが)
+    - 計算ロジックをドキュメントとして残しておきたかった
+    - 適切な変数名が使用されている場合はプログラムの方が読みやすい(エクセルはセル番号を用いて計算式が書かれるため、中身を追いにくい)
+  - 既存のエクセルに不満があった
+    - 動作が遅い
+    - 債券を特定する情報として銘柄コードを保持しておらず信用スプレッドを付与する作業に手間がかかり過ぎる
+    - 銘柄毎に計算結果と決算値との差分を取りにくい
+
+## 計算の流れ
+
+- XNETから全取引を取り出す(IT51)
+- 取引=買を集計して計算基準日時点の購入債券データ(bond_data_buy)を作る
+  - 劣後債は償還日をファーストコールに置き換える
+- 利子一括債は、期中の利息を受け取らない代わりに償還日に一括して受け取るため、利息、未収利息、時価の計算用に専用のデータ(maturity_rate,interest_batch_rate)を作成する
+- 計算基準日から償還日までの{利息、償還金額、アモチアキュム、簿価、未収利息、運用収益、時価、含み損益}を計算する(bond_cf_buy)
+- 取引=売を集計して計算基準日時点の売却済債券データ(bond_data_sell)を作る
+- 購入債券データの各種日付と売却日を比較して売却後の項目は符号を反転させたデータ(bond_cf_sell)を作る
+- 購入分のデータと売却分のデータを結合させたデータ(bond_cf)をcsvとして保存する
+
+```{r}
+DiagrammeR::mermaid("11_object_sq.mmd")
+```
+
+# 変数名
+
+項目名|変数名|備考
+:---|:---|:---
+銘柄コード|stock_code
+銘柄名|stock_name
+利率|coupon_rate|単位:パーセント
+発行日|issued_date
+償還日|maturity_date
+利払日|coupon_md|1-4桁:上期配当日,4-8桁:下期配当日
+取引|dealing
+約定日|trade_date
+受渡日|delivery_date
+額面|par
+約定代金|trade_amount
+計上損益(IT51)|amount
+計上利配額(IT51)|interest
+区分経理|division|一般:general,全社:company
+保有目的|category|その他:other,満期:maturity
+計算対象年度|curr_fyear
+計算対象年度の期首|start_date|購入年度は受渡日
+計算対象年度の期末|end_date|償還年度は償還日
+受渡日時点の残存年数|current_maturity_year_delivery|端数切捨て,償還年度の1年前は0
+計算対象年度末時点の残存年数|current_maturity_year|端数切捨て,償還年度の1年前は0
+リスクフリー金利|risk_free
+信用スプレッド|credit_spread
+適用金利|yield
+利払日(上期)|coupon1_date|受取が無い場合はNA
+利払日(下期)|coupon2_date|受取が無い場合はNA
+利息(上期)|coupon1
+利息(下期)|coupon2
+利息(償還)|coupon_maturity
+償還金額|maturity
+回収金額|amt|=coupon1+coupon2+coupon_maturity+maturity
+期首時点の累計償却額|amoacc_sum_s
+期末時点の累計償却額|amoacc_sum_e
+アモチアキュム|amoacc|=amoacc_sum_e-amoacc_sum_s
+期首時点の簿価|book_value_curr_s|=trade_amount+amoacc_sum_s
+期末時点の簿価|book_value_curr_e|=trade_amount+amoacc_sum_e
+期首時点の未収利息|accrued_interest_s
+期末時点の未収利息|accrued_interest_e
+運用収益|benefit|=coupon+amoacc-accrued_interest_s+accrued_interest_e
+時価|price
+含み損益|unrealized|price-book_value_curr_e
+
+# IT51について
+
+- 取引データが収録されている。ただし、各四半期末にはアモチアキュム、未収利息が計算されるなど、時価以外の情報はおおよそこのデータから集計可能。
+- XNETから取得するデータは拡張子が.datになっている
+- また、文字コードはeuc-jpになっているのでshift-jisに置き換える
+
+```{r}
+DiagrammeR::mermaid("12_bond_raw.mmd")
+```
+
+# 利子一括債について
+
+- 期中の利息を受け取らない代わりに償還日に一括して利息を受け取る特殊な債券であり、利息、未収利息、時価の計算が通常の債券と異なる
+  - 期の途中では利息を作成せず、償還時の利息として「利息の償還時点の価値」を作成する
+  - 未収利息は期末時点で獲得している利息の期末時点の価値となる
+  - 時価の計算の額面は(通常の額面+未獲得利息の償還時価値)として計算する
+- 以下、内容の理解のために$\Sigma$を解いたものも記載しているが、実際には途中で端数処理が入るケースもあるのでプログラム中は$\Sigma$を解かないで計算している場合がある
+
+## 記号
+
+- N:利払回数
+- rest:最終利払応当日から償還日までの日数
+- r:利率
+- M:期末までに獲得した利息の回数
+- elapse:「期末までに獲得した利息のうち最も近いの利払応当日」から期末日までの日数
+- interval:「期末までに獲得した利息のうち最も近いの利払応当日」から「期末日から見た次の利払応当日」までの日数
+
+### rest,elapse,intervalの関係
+
+```{r}
+DiagrammeR::mermaid("13_interest_batch.mmd")
+```
+
+
+## 償還時の利息
+
+$$
+\eq{
+償還時の利息 &=& 額面\times\{1+r\times\frac{rest}{365}+\sum_{k=0}^{N-1}\frac{r}{2}\times(1+\frac{r}{2})^k\times(1+r\times\frac{rest}{365})\}\\
+&=&額面\times(1+\frac{r}{2})^N\times(1+r\times\frac{rest}{365})
+}
+$$
+
+## 未収利息
+
+$$
+\eq{
+未収利息&=&額面\times\{r\times\frac{elapse}{365}+\sum_{k=0}^{M}\frac{r}{2}\times(1+\frac{r}{2})^k\times(1+r\times\frac{elapse}{365})\}\\
+&=&額面\times\{(1+\frac{r}{2})^{(M+1)}\times(1+r\times\frac{elapse}{365})-1\}
+}
+$$
+
+## 未獲得利息の償還時価値
+
+$$
+\eq{
+未獲得利息の償還時価値&=&額面\times\{\sum_{k=0}^{N-M-1}\frac{r}{2}\times(1+\frac{r}{2})^k\times(1+r\times\frac{rest}{365})+r\times\frac{rest}{365}-\frac{r}{2}\times(1+\frac{r}{2})^{(N-M-1)}\times(1+r\times\frac{elapse}{365})\times\frac{elapse}{interval}\}\\
+&=&額面\times\{(1+\frac{r}{2})^{(N-M)}\times(1+r\times\frac{elapse}{365})-1-\frac{r}{2}\times(1+\frac{r}{2})^{(N-M-1)}\times(1+r\times\frac{elapse}{365})\times\frac{elapse}{interval}\}
+}
+$$
+
+# 計算
+
+## 利息
+
+- 年に2回支払われる
+- 各利払日が「受渡日<利払日<=償還日」を満たす場合に利息=(償還金額$\times$利率/2)を作成する
+- 償還日と利払日が一致しない場合は、償還時の利息=(償還金額$\times$利率$\times$(償還日-最終利払日)/365)を作成する
+- 利子一括債は、期の途中では利息を作成しないで、償還時の利息として「利息の償還時点の価値」を作成する
+- 発行から6ヶ月未満に利払日が到来する場合、銘柄によっては初回利息が支払われないケースがあり、初回利息だけはこの計算ロジックが当てはまらない場合がある。個別銘柄に依存するため、この差異は許容する
+
+## 償還金額
+
+- 償還日に償還金額=額面を作成する
+
+## アモチアキュム
+
+- アモチアキュム=期末時点の累計償却額-期首時点の累計償却額
+- 期末時点の累計償却額=(額面-約定代金)$\times\dfrac{初回経過期間+調整係数\times(経過月数-初回経過期間)}{購入時残存期間}$
+  - 調整係数=$\case{1 & & \text{day(受渡日)<day(償還日) or 受渡日が月末}\\ \dfrac{購入時残存期間-初回経過期間}{購入時残存期間-初回経過期間+1} & & \text{otherwise}}$
+
+### 変数
+
+項目名|変数名|備考
+:---|:---|:---
+購入時残存期間|current_maturity|受渡日から償還日までの月数(端数切上)
+初回経過期間|elap_months_init|受渡日から受渡日の属する年度末までの経過月数(端数切上)
+経過期間(期首)|elap_months_s|受渡日から計算対象年度の期首までの経過月数(端数切上)
+経過期間(期末)|elap_months_e|受渡日から計算対象年度の期末までの経過月数(端数切上)
+調整係数(アモチアキュム)|months_adjust
+
+### 導出
+
+- アモチアキュムは前期末簿価と額面を用いて計算する方法がもちられていた
+- しかし、この方法だとアモチアキュムと簿価を交互に計算しなければならず、プログラムに組込みにくかったため、簿価を経由せずにアモチアキュムを計算する方式を採用した
+
+#### 背景
+
+- アモチアキュムは、以下の用に計算されている
+$$アモチアキュム=\case{(額面-約定代金)\times\dfrac{受渡日から期末までの経過月数(端数切上)}{受渡日から償還日までの経過月数(端数切上)} & & \text{購入初年度}\\ (額面-前期末簿価)\times\dfrac{前期末から当期末までの経過月数(端数切上)}{前期末から償還日までの経過月数(端数切上)} & & \text{otherwise}}$$
+- これだと、アモチアキュム(期間1)→簿価(期間1)→アモチアキュム(期間2)→簿価(期間2)→…と、アモチアキュムと簿価を交互に計算することが求められてしまい、プログラムに組込みにくい
+- そもそも前期末簿価も額面、約定代金、経過月数から計算可能な訳なので、これらを引数としてアモチアキュムが求められるはず
+
+#### 留意点
+
+- 経過月数に端数切上処理が入っているせいで、「前期末から償還日までの経過月数」の計算に条件判定が必要となる
+$$前期末から償還日までの経過月数=\case{購入時残存期間-初回経過期間-12k & & \text{day(受渡日)<day(償還日) or 受渡日が月末}\\購入時残存期間-初回経過期間+1-12k & & \text{otherwise}}$$
+- 例1:受渡日=2017/4/5,償還日=2019/4/10の場合
+  - 購入初年度の計数:期末=2018/3/31,購入時残存期間=25,初回経過期間=12
+  - 購入２年目の計数:期末=2019/3/31,前期末から当期末までの経過月数=12,前期末から償還日までの経過月数=13
+
+- 例2:受渡日=2017/4/10,償還日=2019/4/10の場合
+  - 購入初年度の計数:期末=2018/3/31,購入時残存期間=24,初回経過期間=12
+  - 購入２年目の計数:期末=2019/3/31,前期末から当期末までの経過月数=12,前期末から償還日までの経過月数=13
+
+- 例3:受渡日=2017/4/30,償還日=2019/4/10の場合
+  - 購入初年度の計数:期末=2018/3/31,購入時残存期間=24,初回経過期間=11
+  - 購入２年目の計数:期末=2019/3/31,前期末から当期末までの経過月数=12,前期末から償還日までの経過月数=13
+
+#### 式展開
+
+- $B_0$:約定代金,$B_n$:額面,$B_t$:期間tの期末簿価$(t=1,\cdots,n-1)$
+- $amoacc_t$:期間tのアモチアキュム
+- init:初回経過期間
+- length:購入時残存期間
+- elapse:経過期間
+
+##### case1:day(受渡日)<day(償還日) or 受渡日が月末
+
+- $\case{B_1=B_0+(B_n-B_0)\times\frac{init}{length}\\ B_{t+1}=B_t+(B_n-B_t)\times\frac{12}{length-init-12t}}$
+- $\Leftrightarrow B_t=B_0+(B_n-B_0)\times\dfrac{init+12(t-1)}{length}$
+- $\Leftrightarrow \sum_{k=1}^{t}amoacc_k=(B_n-B_0)\times\dfrac{init+12(t-1)}{length}$
+- $\Leftrightarrow \sum_{k=1}^{t}amoacc_k=(B_n-B_0)\times\dfrac{elapse}{length}$
+
+##### case2:otherwise
+
+- $\case{B_1=B_0+(B_n-B_0)\times\frac{init}{length}\\ B_{t+1}=B_t+(B_n-B_t)\times\frac{12}{length-init+1-12t}}$
+- $\Leftrightarrow B_t=B_0+(B_n-B_0)\times\{\dfrac{(length-init)\times 12(t-1)}{length\times(length-init+1)}+\dfrac{init}{length}\}$
+- $\Leftrightarrow \sum_{k=1}^{t}amoacc_k=(B_n-B_0)\times\{\dfrac{(length-init)\times 12(t-1)}{length\times(length-init+1)}+\dfrac{init}{length}\}$
+- $\Leftrightarrow \sum_{k=1}^{t}amoacc_k=(B_n-B_0)\times\{\dfrac{(length-init)\times (elapse-init)}{length\times(length-init+1)}+\dfrac{init}{length}\}$
+
+## 簿価
+
+- 期末簿価=約定代金+期末時点の累計償却額
+
+## 未収利息
+
+- 未収利息=$\case{額面\times利率\times\frac{\text{受渡日から期末までの日数}}{365} & & \text{購入初年度}\ and\ \text{下期利払日<受渡日}\\ 額面\times利率\times\frac{\text{下期利払日から期末までの日数}}{365} & & otherwise}$
+
+- 利子一括債は特別に計算したものを未収利息として使用する
+
+- 利息計算と同様に、発行から6ヶ月未満に利払日が到来する場合、銘柄によっては初回利息が支払われないケースがあり、下期利払日を正確に判定できないため、この計算ロジックが当てはまらない場合がある。個別銘柄に依存するため、この差異は許容する
+
+## 運用収益
+
+- 運用収益=利息+アモチアキュム-前期未収利息+当期未収利息
+
+## 時価
+
+- 額面1に対する時価を計算して、時価=(額面$\times$額面1に対する時価)で計算する
+- ただし、利子一括債は時価=((額面+未獲得利息の償還時価値)$\times$額面1に対する時価)
+
+### 額面1に対する時価
+
+- Excelのprice関数を参考にして同等の計算式を設定している
+- 利払日は償還日を基準として年2回支払われる(実際には償還日と利払日がずれているケースはあるが無視している)
+
+#### 記号
+
+  - coupon:クーポン利回り
+  - yield:市場金利
+  - N:時価評価の基準日と償還日の間の利払回数
+  - DSC:時価評価の基準日から次の利払日までの日数
+  - E:直近利払日から次の利払日までの日数
+  - A:直近利払日から時価評価の基準日までの日数
+
+##### DSC,E,Aの関係
+
+```{r}
+DiagrammeR::mermaid("14_price.mmd")
+```
+
+
+#### 計算式
+
+- N>1の場合
+  - $price=exp_{1st}+exp_{2nd}-exp_{3rd}$
+    - $exp_{1st}=(1+\frac{yield}{2})^{-(N-1+\frac{DSC}{E})}$
+    - $\eq{ exp_{2nd}&=&\sum_{k=1}^{N}\frac{\frac{coupon}{2}}{(1+\frac{yield}{2})^{(k-1+\frac{DSC}{E})}}\\&=&\frac{coupon}{yield}\times(1+\frac{yield}{2})^{(1-\frac{DSC}{E})}\times(1-(1+\frac{yield}{2})^{-N})}$
+    - $exp_{3rd}=\frac{coupon}{2}\times\frac{A}{E}$
+    
+- N=1の場合
+  - $price=\dfrac{exp_{1st}}{exp_{2nd}}-exp_{3rd}$
+    - $exp_{1st}=1+\frac{coupon}{2}$
+    - $exp_{2nd}=1+\frac{yield}{2}\times\frac{E-A}{E}$
+    - $exp_{3rd}=\frac{coupon}{2}\times \frac{A}{E}$
+    
+## 含み損益
+
+- 含み損益=時価-簿価
