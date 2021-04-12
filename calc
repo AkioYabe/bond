@@ -1,0 +1,198 @@
+library(tidyverse)
+library(foreach)
+library(readxl)
+library(lubridate)
+library(scales)
+
+options(digits = 10)
+# setwd("~/lab/bond")
+setwd("X:/30～40主計関連/07計理人補助業務/資産運用関係/bond")
+source("script/00_functions.r")
+
+base_date_num <- 210331
+opening_date<-ymd(base_date_num)-years(1)+days(1)
+
+col_name<-read_xlsx(path="excel/col_name.xlsx",col_types = "text")
+
+interest_batch<-read_xlsx(path = "excel/stock_info.xlsx"
+                          ,sheet = "info"
+                          ,col_types = "text") %>% 
+  pull(stock_code)
+
+first_call<-read_xlsx(path="excel/stock_info.xlsx"
+                      ,sheet = "first_call"
+                      ,col_types = "text") %>% 
+  mutate(maturity_date=str_sub(maturity_date,3,8))
+
+risk_free_rate <- bind_rows(
+  read_xlsx(path = "excel/yield.xlsx"
+            ,sheet = "risk_free_real"
+            ,col_types = "text") %>% 
+    mutate(risk_free_rate_type="real")
+  ,read_xlsx(path = "excel/yield.xlsx"
+             ,sheet = "risk_free_assumption"
+             ,col_types = "text") %>% 
+    mutate(risk_free_rate_type="assumption")
+) %>% mutate_at(vars(rate),as.numeric) %>% 
+  mutate(risk_free=(rate+lead(rate,n=1))/2) %>% 
+  select(current_maturity_year,risk_free_rate_type,risk_free)
+
+credit_spread<-read_xlsx(path = "excel/yield.xlsx"
+                            ,sheet = "credit_spread"
+                            ,col_types = "text") %>% 
+  mutate_at(vars(credit_spread),as.numeric)
+
+bond_raw <- foreach(file=c(list.files("data/dat/202003",pattern = "it51_(.+).dat$",full.names = T)
+                           ,list.files("data/dat/202103",pattern = "it51_(.+).dat$",full.names = T)))%do%{
+  read.csv(file,encoding = "cp932",skip=2,colClasses="character") %>%
+    filter(`銘柄コード`!="ポートフォリオ計") %>% 
+    mutate(division=case_when(str_detect(file,pattern = "全社") ~ "company"
+                              ,TRUE ~ "general")
+           ,category=case_when(str_detect(file,pattern = "満期")~"maturity"
+                               ,TRUE ~ "other"))
+} %>% bind_rows()
+
+invisible(
+  foreach(i=1:nrow(col_name))%do%{
+    index<-which(names(bond_raw)==col_name$data_name[i])
+    if(0!=length(index))
+      names(bond_raw)[index]<-col_name$var_name[i]
+  }  
+)
+
+# bond_raw <- bond_raw %>% filter(ymd(delivery_date)<ymd(20210101))
+
+# buy data ----------------------------------------------------------------
+
+bond_data_buy<-bind_rows(
+  bond_raw %>% 
+    filter(stock_code %in% first_call$stock_code) %>% 
+    select(-maturity_date) %>% 
+    left_join(first_call,by="stock_code")
+  ,bond_raw %>% 
+    filter(!(stock_code %in% first_call$stock_code))
+) %>% 
+  filter(dealing=="買"
+         ,as.integer(trade_date)<=base_date_num
+         ,opening_date<=ymd(maturity_date)) %>% 
+  mutate(dealing="buy"
+         ,coupon_md=if_else(nchar(coupon_md)==7,paste0("0",coupon_md),coupon_md)
+         ,coupon1_md=str_sub(coupon_md,start = 1,end = 4)
+         ,coupon1_md=if_else(coupon1_md=="0229","0228",coupon1_md)
+         ,coupon2_md=str_sub(coupon_md,start = 5,end = 8)
+         #coupon_rateが入っていないデータを上書き
+         ,coupon_rate=if_else(stock_code=="83160401","1.39",coupon_rate)
+         ,issued_date=if_else(issued_date==""
+                              ,delivery_date
+                              ,sprintf("%06d",as.integer(issued_date)))) %>% 
+  select(stock_code,stock_name,issued_date,delivery_date,maturity_date,coupon1_md,coupon2_md,coupon_rate,par,trade_amount,dealing,division,category) %>% 
+  mutate_at(vars(issued_date,delivery_date,maturity_date),ymd) %>% 
+  mutate_at(vars(coupon_rate,par,trade_amount),as.numeric) %>% 
+  group_by(stock_code) %>% 
+  mutate(no=row_number()) %>% ungroup()
+
+bond_data_buy$par %>% sum() %>% comma()
+
+interest_batch_list<-do.call(df2list
+                             ,bond_data_buy %>% 
+                               filter(stock_code %in% interest_batch) %>% 
+                               select(stock_code,issued_date,maturity_date,coupon_rate) %>% 
+                               mutate(coupon_rate=coupon_rate/100) %>% distinct())
+#debugonce("calc_interest_batch")
+if(length(interest_batch_list)==0){
+  interest_batch_rate <- maturity_rate <- NA
+}else{
+  interest_batch_rate<-foreach(arg=interest_batch_list)%do%{
+    calc_interest_batch(arg) %>% 
+      mutate(stock_code=arg$stock_code)
+  } %>% bind_rows() %>% 
+    rename(end_date=curr_date)
+  
+  maturity_rate<-foreach(arg=interest_batch_list)%do%{
+    calc_interest_batch(arg,type = "maturity") %>% 
+      mutate(stock_code=arg$stock_code)
+  } %>% bind_rows() %>% 
+    select(stock_code,maturity_rate)  
+}
+
+# debugonce("calc_cf_buy")
+bond_cf_buy <- calc_cf_buy(bond_data_buy
+                           ,opening_date
+                           ,interest_batch
+                           ,maturity_rate
+                           ,interest_batch_rate
+                           ,risk_free_rate
+                           ,credit_spread)
+
+# sell data ---------------------------------------------------------------
+
+bond_data_sell <- bond_raw %>% 
+  filter(dealing=="売"
+         ,opening_date<=ymd(maturity_date)) %>%
+  select(stock_code,sell_date=trade_date,sell_total_par=par) %>% 
+  mutate(sell_total_par=as.numeric(sell_total_par)
+         ,sell_date=ymd(sell_date))
+
+# 1債券につき売りは1レコードの場合のみ対応しているため、複数レコードある場合は止める
+stopifnot(nrow(bond_data_sell)==length(unique(bond_data_sell$stock_code)))
+
+bond_data_sell <- bond_data_buy %>% 
+  filter(stock_code %in% bond_data_sell$stock_code) %>% 
+  select(stock_code,no,buy_par=par) %>% 
+  group_by(stock_code) %>% 
+  mutate(buy_cumsum_par=cumsum(buy_par)) %>% ungroup() %>% 
+  left_join(bond_data_sell
+            ,by="stock_code") %>% 
+  mutate(sell_par=if_else(buy_cumsum_par<=sell_total_par,buy_par
+                          ,pmax(buy_par-(buy_cumsum_par-sell_total_par),0))
+         ,ratio=sell_par/buy_par) %>% 
+  filter(ratio!=0) %>% 
+  select(stock_code,no,sell_date,ratio)
+
+bond_cf_sell <- calc_cf_sell(bond_cf_buy
+                             ,bond_data_sell)
+
+
+# union -------------------------------------------------------------------
+
+bond_cf <- bind_rows(bond_cf_buy
+                     ,bond_cf_sell)
+
+var_name2data_name <- function(names){
+  sapply(names,function(name){
+    if(name %in% col_name$var_name){
+      return(col_name$data_name[which(name==col_name$var_name)])
+    }else{
+      return(name)
+    }  
+  })
+}
+
+
+# check -------------------------------------------------------------------
+
+# 国債以外の債券には信用スプレッドが存在するはず
+# 売却して保有が無い場合は購入+売却で額面が相殺されているはず
+stock_code_ <- credit_spread[["stock_code"]]
+
+stopifnot(0==nrow(bond_cf %>% 
+                    filter(curr_fyear==date2fyear(opening_date)
+                           ,!str_detect(stock_code,pattern = "^0067")
+                           ,!str_detect(stock_code,pattern = "^0068")
+                           ,!str_detect(stock_code,pattern = "^0069")
+                           ,!(stock_code %in% stock_code_)) %>% 
+                    group_by(stock_code,stock_name) %>% 
+                    filter(0!=sum(par))))
+
+# save --------------------------------------------------------------------
+
+write.csv(bond_cf %>%
+            rename_with(var_name2data_name)
+          ,file = sprintf("data/csv/bond_cf_%s.csv",base_date_num)
+          ,row.names = F)
+
+saveRDS(bond_cf
+        ,file = sprintf("data/rds/bond_cf_%s.rds",base_date_num))
+
+saveRDS(bond_raw
+        ,file = sprintf("data/rds/bond_raw_%s.rds",base_date_num))
