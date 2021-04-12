@@ -1,0 +1,17 @@
+graph TD
+
+subgraph X-net:encode=EUC-JP
+  IT51_xnet_m_g("IT51<br/>満期一般")
+  IT51_xnet_o_g("IT51<br/>その他一般")
+  IT51_xnet_o_c("IT51<br/>その他全社")
+end
+
+subgraph data/yyyymm:encode=CP932
+  IT51_data_m_g("IT51<br/>満期一般")
+  IT51_data_o_g("IT51<br/>その他一般")
+  IT51_data_o_c("IT51<br/>その他全社")
+end
+
+IT51_xnet_m_g-->|convert_eucjp2shiftjis|IT51_data_m_g
+IT51_xnet_o_g-->|convert_eucjp2shiftjis|IT51_data_o_g
+IT51_xnet_o_c-->|convert_eucjp2shiftjis|IT51_data_o_c
